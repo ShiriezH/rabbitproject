@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/bootdotdev/learn-pub-sub-starter/internal/gamelogic"
 	"github.com/bootdotdev/learn-pub-sub-starter/internal/pubsub"
@@ -11,7 +12,6 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-// Handler for pause/resume messages
 func handlerPause(gs *gamelogic.GameState) func(routing.PlayingState) pubsub.AckType {
 	return func(ps routing.PlayingState) pubsub.AckType {
 		defer fmt.Print("> ")
@@ -20,89 +20,139 @@ func handlerPause(gs *gamelogic.GameState) func(routing.PlayingState) pubsub.Ack
 	}
 }
 
-// Handler for move messages
-func handlerMove(gs *gamelogic.GameState) func(gamelogic.ArmyMove) pubsub.AckType {
+func handlerMove(gs *gamelogic.GameState, ch *amqp.Channel) func(gamelogic.ArmyMove) pubsub.AckType {
 	return func(move gamelogic.ArmyMove) pubsub.AckType {
 		defer fmt.Print("> ")
 
-		result := gs.HandleMove(move)
+		outcome := gs.HandleMove(move)
 
-		switch result {
-		case 0, 1: // safe, make war
+		switch outcome {
+
+		case gamelogic.MoveOutcomeMakeWar:
+			err := pubsub.PublishJSON(
+				ch,
+				routing.ExchangePerilTopic,
+				fmt.Sprintf("%s.%s", routing.WarRecognitionsPrefix, gs.GetPlayerSnap()),
+				gamelogic.RecognitionOfWar{
+					Attacker: move.Player,
+					Defender: gs.GetPlayerSnap(),
+				},
+			)
+			if err != nil {
+				fmt.Println("Failed to publish war:", err)
+				return pubsub.NackRequeue
+			}
 			return pubsub.Ack
 
-		case 2: // same player
+		case gamelogic.MoveOutcomeSamePlayer:
 			return pubsub.NackDiscard
+
+		default:
+			return pubsub.Ack
+		}
+	}
+}
+
+func handlerWar(gs *gamelogic.GameState, ch *amqp.Channel) func(gamelogic.RecognitionOfWar) pubsub.AckType {
+	return func(w gamelogic.RecognitionOfWar) pubsub.AckType {
+		defer fmt.Print("> ")
+
+		outcome, winner, loser := gs.HandleWar(w)
+
+		var message string
+
+		switch outcome {
+
+		case gamelogic.WarOutcomeNotInvolved:
+			return pubsub.NackRequeue
+
+		case gamelogic.WarOutcomeNoUnits:
+			return pubsub.NackDiscard
+
+		case gamelogic.WarOutcomeOpponentWon,
+			gamelogic.WarOutcomeYouWon:
+			message = fmt.Sprintf("%s won a war against %s", winner, loser)
+
+		case gamelogic.WarOutcomeDraw:
+			message = fmt.Sprintf("A war between %s and %s resulted in a draw", winner, loser)
 
 		default:
 			return pubsub.NackDiscard
 		}
+
+		err := pubsub.PublishGob(
+			ch,
+			routing.ExchangePerilTopic,
+			fmt.Sprintf("%s.%s", routing.GameLogSlug, winner),
+			routing.GameLog{
+				CurrentTime: time.Now(),
+				Message:     message,
+				Username:    winner,
+			},
+		)
+
+		if err != nil {
+			fmt.Println("Failed to publish log:", err)
+			return pubsub.NackRequeue
+		}
+
+		return pubsub.Ack
 	}
 }
 
 func main() {
 	fmt.Println("Starting Peril client...")
 
-	// Get username
 	username, err := gamelogic.ClientWelcome()
 	if err != nil {
 		log.Fatalf("Failed to get username: %v", err)
 	}
 
-	// Connect to RabbitMQ
-	connStr := "amqp://guest:guest@localhost:5672/"
-	conn, err := amqp.Dial(connStr)
+	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
 	if err != nil {
 		log.Fatalf("Failed to connect: %v", err)
 	}
 	defer conn.Close()
 
-	// Channel for publishing
 	ch, err := conn.Channel()
 	if err != nil {
 		log.Fatalf("Failed to open channel: %v", err)
 	}
 	defer ch.Close()
 
-	// Create game state
 	gameState := gamelogic.NewGameState(username)
 
-	// Subscribe to pause
-	pauseQueue := fmt.Sprintf("%s.%s", routing.PauseKey, username)
-
-	err = pubsub.SubscribeJSON(
+	pubsub.SubscribeJSON(
 		conn,
 		routing.ExchangePerilDirect,
-		pauseQueue,
+		fmt.Sprintf("%s.%s", routing.PauseKey, username),
 		routing.PauseKey,
 		pubsub.Transient,
 		handlerPause(gameState),
 	)
-	if err != nil {
-		log.Fatalf("Failed to subscribe (pause): %v", err)
-	}
 
-	// Subscribe to moves
-	moveQueue := fmt.Sprintf("army_moves.%s", username)
-
-	err = pubsub.SubscribeJSON(
+	pubsub.SubscribeJSON(
 		conn,
 		routing.ExchangePerilTopic,
-		moveQueue,
+		fmt.Sprintf("army_moves.%s", username),
 		"army_moves.*",
 		pubsub.Transient,
-		handlerMove(gameState),
+		handlerMove(gameState, ch),
 	)
-	if err != nil {
-		log.Fatalf("Failed to subscribe (moves): %v", err)
-	}
 
-	fmt.Printf("Listening on queues: %s and %s\n", pauseQueue, moveQueue)
+	pubsub.SubscribeJSON(
+		conn,
+		routing.ExchangePerilTopic,
+		"war",
+		fmt.Sprintf("%s.*", routing.WarRecognitionsPrefix),
+		pubsub.Durable,
+		handlerWar(gameState, ch),
+	)
 
-	// Show help
+	fmt.Println("Client ready")
+
 	gamelogic.PrintClientHelp()
 
-	// REPL loop
 	for {
 		words := gamelogic.GetInput()
 
@@ -122,28 +172,18 @@ func main() {
 				continue
 			}
 
-			fmt.Println("Move successful")
-
-			err = pubsub.PublishJSON(
+			pubsub.PublishJSON(
 				ch,
 				routing.ExchangePerilTopic,
 				fmt.Sprintf("army_moves.%s", username),
 				moveEvent,
 			)
-			if err != nil {
-				fmt.Println("Failed to publish move:", err)
-			} else {
-				fmt.Println("Move published")
-			}
 
 		case "status":
 			gameState.CommandStatus()
 
 		case "help":
 			gamelogic.PrintClientHelp()
-
-		case "spam":
-			fmt.Println("Spamming not allowed yet")
 
 		case "quit":
 			gamelogic.PrintQuit()
@@ -154,4 +194,3 @@ func main() {
 		}
 	}
 }
-

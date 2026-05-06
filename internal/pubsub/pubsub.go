@@ -1,7 +1,9 @@
 package pubsub
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
 
@@ -42,6 +44,27 @@ func PublishJSON[T any](ch *amqp.Channel, exchange, key string, val T) error {
 	)
 }
 
+func PublishGob[T any](ch *amqp.Channel, exchange, key string, val T) error {
+	var buf bytes.Buffer
+
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(val); err != nil {
+		return err
+	}
+
+	return ch.PublishWithContext(
+		context.Background(),
+		exchange,
+		key,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType: "application/gob",
+			Body:        buf.Bytes(),
+		},
+	)
+}
+
 func DeclareAndBind(
 	conn *amqp.Connection,
 	exchange,
@@ -59,7 +82,6 @@ func DeclareAndBind(
 	autoDelete := queueType == Transient
 	exclusive := queueType == Transient
 
-	// Dead letter exchange config
 	args := amqp.Table{
 		"x-dead-letter-exchange": "peril_dlx",
 	}
@@ -90,6 +112,7 @@ func DeclareAndBind(
 	return ch, q, nil
 }
 
+// JSON subscriber
 func SubscribeJSON[T any](
 	conn *amqp.Connection,
 	exchange,
@@ -104,15 +127,7 @@ func SubscribeJSON[T any](
 		return err
 	}
 
-	msgs, err := ch.Consume(
-		queueName,
-		"",
-		false, // manual ack
-		false,
-		false,
-		false,
-		nil,
-	)
+	msgs, err := ch.Consume(queueName, "", false, false, false, false, nil)
 	if err != nil {
 		return err
 	}
@@ -121,25 +136,65 @@ func SubscribeJSON[T any](
 		for d := range msgs {
 			var val T
 
-			err := json.Unmarshal(d.Body, &val)
-			if err != nil {
-				fmt.Println("Unmarshal failed → NACK DISCARD")
+			if err := json.Unmarshal(d.Body, &val); err != nil {
+				fmt.Println("JSON decode failed → NACK DISCARD")
 				d.Nack(false, false)
 				continue
 			}
 
 			switch handler(val) {
-
 			case Ack:
-				fmt.Println("ACK")
 				d.Ack(false)
-
 			case NackRequeue:
-				fmt.Println("NACK REQUEUE")
 				d.Nack(false, true)
-
 			case NackDiscard:
-				fmt.Println("NACK DISCARD")
+				d.Nack(false, false)
+			}
+		}
+	}()
+
+	return nil
+}
+
+// GOB subscriber (NEW)
+func SubscribeGob[T any](
+	conn *amqp.Connection,
+	exchange,
+	queueName,
+	key string,
+	queueType SimpleQueueType,
+	handler func(T) AckType,
+) error {
+
+	ch, _, err := DeclareAndBind(conn, exchange, queueName, key, queueType)
+	if err != nil {
+		return err
+	}
+
+	msgs, err := ch.Consume(queueName, "", false, false, false, false, nil)
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		for d := range msgs {
+			var val T
+
+			buf := bytes.NewBuffer(d.Body)
+			dec := gob.NewDecoder(buf)
+
+			if err := dec.Decode(&val); err != nil {
+				fmt.Println("GOB decode failed → NACK DISCARD")
+				d.Nack(false, false)
+				continue
+			}
+
+			switch handler(val) {
+			case Ack:
+				d.Ack(false)
+			case NackRequeue:
+				d.Nack(false, true)
+			case NackDiscard:
 				d.Nack(false, false)
 			}
 		}
