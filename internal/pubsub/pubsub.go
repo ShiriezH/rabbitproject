@@ -127,7 +127,25 @@ func SubscribeJSON[T any](
 		return err
 	}
 
-	msgs, err := ch.Consume(queueName, "", false, false, false, false, nil)
+	// PREFETCH LIMIT
+	err = ch.Qos(
+		10,    // prefetch count
+		0,     // prefetch size
+		false, // global
+	)
+	if err != nil {
+		return err
+	}
+
+	msgs, err := ch.Consume(
+		queueName,
+		"",
+		false,
+		false,
+		false,
+		false,
+		nil,
+	)
 	if err != nil {
 		return err
 	}
@@ -143,10 +161,13 @@ func SubscribeJSON[T any](
 			}
 
 			switch handler(val) {
+
 			case Ack:
 				d.Ack(false)
+
 			case NackRequeue:
 				d.Nack(false, true)
+
 			case NackDiscard:
 				d.Nack(false, false)
 			}
@@ -156,7 +177,7 @@ func SubscribeJSON[T any](
 	return nil
 }
 
-// GOB subscriber (NEW)
+// GOB subscriber
 func SubscribeGob[T any](
 	conn *amqp.Connection,
 	exchange,
@@ -171,7 +192,25 @@ func SubscribeGob[T any](
 		return err
 	}
 
-	msgs, err := ch.Consume(queueName, "", false, false, false, false, nil)
+	// PREFETCH LIMIT
+	err = ch.Qos(
+		10,    // prefetch count
+		0,     // prefetch size
+		false, // global
+	)
+	if err != nil {
+		return err
+	}
+
+	msgs, err := ch.Consume(
+		queueName,
+		"",
+		false,
+		false,
+		false,
+		false,
+		nil,
+	)
 	if err != nil {
 		return err
 	}
@@ -190,10 +229,13 @@ func SubscribeGob[T any](
 			}
 
 			switch handler(val) {
+
 			case Ack:
 				d.Ack(false)
+
 			case NackRequeue:
 				d.Nack(false, true)
+
 			case NackDiscard:
 				d.Nack(false, false)
 			}

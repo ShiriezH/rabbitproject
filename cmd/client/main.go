@@ -29,6 +29,7 @@ func handlerMove(gs *gamelogic.GameState, ch *amqp.Channel) func(gamelogic.ArmyM
 		switch outcome {
 
 		case gamelogic.MoveOutcomeMakeWar:
+
 			err := pubsub.PublishJSON(
 				ch,
 				routing.ExchangePerilTopic,
@@ -38,10 +39,12 @@ func handlerMove(gs *gamelogic.GameState, ch *amqp.Channel) func(gamelogic.ArmyM
 					Defender: gs.GetPlayerSnap(),
 				},
 			)
+
 			if err != nil {
 				fmt.Println("Failed to publish war:", err)
 				return pubsub.NackRequeue
 			}
+
 			return pubsub.Ack
 
 		case gamelogic.MoveOutcomeSamePlayer:
@@ -71,10 +74,20 @@ func handlerWar(gs *gamelogic.GameState, ch *amqp.Channel) func(gamelogic.Recogn
 
 		case gamelogic.WarOutcomeOpponentWon,
 			gamelogic.WarOutcomeYouWon:
-			message = fmt.Sprintf("%s won a war against %s", winner, loser)
+
+			message = fmt.Sprintf(
+				"%s won a war against %s",
+				winner,
+				loser,
+			)
 
 		case gamelogic.WarOutcomeDraw:
-			message = fmt.Sprintf("A war between %s and %s resulted in a draw", winner, loser)
+
+			message = fmt.Sprintf(
+				"A war between %s and %s resulted in a draw",
+				winner,
+				loser,
+			)
 
 		default:
 			return pubsub.NackDiscard
@@ -122,7 +135,7 @@ func main() {
 
 	gameState := gamelogic.NewGameState(username)
 
-	pubsub.SubscribeJSON(
+	err = pubsub.SubscribeJSON(
 		conn,
 		routing.ExchangePerilDirect,
 		fmt.Sprintf("%s.%s", routing.PauseKey, username),
@@ -130,8 +143,11 @@ func main() {
 		pubsub.Transient,
 		handlerPause(gameState),
 	)
+	if err != nil {
+		log.Fatalf("Pause subscribe failed: %v", err)
+	}
 
-	pubsub.SubscribeJSON(
+	err = pubsub.SubscribeJSON(
 		conn,
 		routing.ExchangePerilTopic,
 		fmt.Sprintf("army_moves.%s", username),
@@ -139,8 +155,11 @@ func main() {
 		pubsub.Transient,
 		handlerMove(gameState, ch),
 	)
+	if err != nil {
+		log.Fatalf("Move subscribe failed: %v", err)
+	}
 
-	pubsub.SubscribeJSON(
+	err = pubsub.SubscribeJSON(
 		conn,
 		routing.ExchangePerilTopic,
 		"war",
@@ -148,6 +167,9 @@ func main() {
 		pubsub.Durable,
 		handlerWar(gameState, ch),
 	)
+	if err != nil {
+		log.Fatalf("War subscribe failed: %v", err)
+	}
 
 	fmt.Println("Client ready")
 
@@ -166,18 +188,60 @@ func main() {
 			gameState.CommandSpawn(words)
 
 		case "move":
+
 			moveEvent, err := gameState.CommandMove(words)
 			if err != nil {
 				fmt.Println("Move failed:", err)
 				continue
 			}
 
-			pubsub.PublishJSON(
+			err = pubsub.PublishJSON(
 				ch,
 				routing.ExchangePerilTopic,
 				fmt.Sprintf("army_moves.%s", username),
 				moveEvent,
 			)
+
+			if err != nil {
+				fmt.Println("Failed to publish move:", err)
+			}
+
+		case "spam":
+
+			if len(words) < 2 {
+				fmt.Println("Usage: spam <number>")
+				continue
+			}
+
+			var amount int
+
+			_, err := fmt.Sscanf(words[1], "%d", &amount)
+			if err != nil {
+				fmt.Println("Invalid number")
+				continue
+			}
+
+			for i := 0; i < amount; i++ {
+
+				logMsg := routing.GameLog{
+					CurrentTime: time.Now(),
+					Message:     gamelogic.GetMaliciousLog(),
+					Username:    username,
+				}
+
+				err := pubsub.PublishGob(
+					ch,
+					routing.ExchangePerilTopic,
+					fmt.Sprintf("%s.%s", routing.GameLogSlug, username),
+					logMsg,
+				)
+
+				if err != nil {
+					fmt.Println("Failed to publish spam log:", err)
+				}
+			}
+
+			fmt.Printf("Published %d malicious logs\n", amount)
 
 		case "status":
 			gameState.CommandStatus()

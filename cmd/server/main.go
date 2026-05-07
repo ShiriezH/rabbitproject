@@ -28,7 +28,6 @@ func main() {
 	}
 	defer ch.Close()
 
-	// ✅ FIX: use routing.GameLog instead of custom type
 	err = pubsub.SubscribeGob(
 		conn,
 		routing.ExchangePerilTopic,
